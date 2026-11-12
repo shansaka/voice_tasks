@@ -3,7 +3,6 @@ import AVFoundation
 import Security
 import ServiceManagement
 import AppKit
-import Carbon
 
 struct TaskItem: Codable, Identifiable {
     var id = UUID()
@@ -162,8 +161,6 @@ final class FloatingCapturePanel: NSPanel {
     let model = Model()
     @Published var listening = false
     @Published var settingsVisible = false
-    @Published var shortcutStatus = "Checking keyboard access…"
-    private var monitorTimer: Timer?
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var loginMessage = ""
     func configureLogin(_ enabled: Bool) {
@@ -179,90 +176,28 @@ final class FloatingCapturePanel: NSPanel {
         }
     }
     private var panel: NSPanel?
-    private var eventTap: CFMachPort?
-    private var keyDown = false
     private var starting = false
-    private var releasedWhileStarting = false
-    private var holdTask: Task<Void, Never>?
     private var captureID = UUID()
 
     func setup() {
         if !UserDefaults.standard.bool(forKey: "loginPreferenceConfigured") { configureLogin(true) }
         Task { await model.loadProjects() }
-        setupMonitor(request: true)
-        monitorTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.setupMonitor(request: false) }
-        }
     }
-    func setupMonitor(request: Bool) {
-        if let tap = eventTap, CFMachPortIsValid(tap), CGEvent.tapIsEnabled(tap: tap) {
-            shortcutStatus = "Right Command is ready"; return
-        }
-        if let tap = eventTap, CFMachPortIsValid(tap) {
-            CGEvent.tapEnable(tap: tap, enable: true)
-            if CGEvent.tapIsEnabled(tap: tap) { shortcutStatus = "Right Command is ready"; return }
-            CFMachPortInvalidate(tap); eventTap = nil
-        }
-        if !CGPreflightListenEventAccess() {
-            shortcutStatus = "Allow Input Monitoring for Voice Tasks in System Settings, then reopen the app."
-            if request { _ = CGRequestListenEventAccess() }
-            return
-        }
-        let mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
-        let pointer = Unmanaged.passUnretained(self).toOpaque()
-        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly, eventsOfInterest: CGEventMask(mask), callback: { _, type, event, info in
-            guard let info else { return Unmanaged.passUnretained(event) }
-            let controller = Unmanaged<CaptureController>.fromOpaque(info).takeUnretainedValue()
-            let code = event.getIntegerValueField(.keyboardEventKeycode)
-            let rightDown = (event.flags.rawValue & 0x10) != 0
-            DispatchQueue.main.async { controller.keyEvent(type: type, code: code, rightDown: rightDown) }
-            return Unmanaged.passUnretained(event)
-        }, userInfo: pointer) else { shortcutStatus = "Keyboard listener unavailable. Check Input Monitoring, then reopen the app."; return }
-        eventTap = tap
-        CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
-        shortcutStatus = CGEvent.tapIsEnabled(tap: tap) ? "Right Command is ready" : "Keyboard listener unavailable. Check Input Monitoring."
-    }
-    func keyEvent(type: CGEventType, code: Int64, rightDown: Bool) {
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            holdTask?.cancel(); keyDown = false; captureID = UUID(); model.cancelRecording(); listening = false; panel?.orderOut(nil)
-            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
-            setupMonitor(request: false); return
-        }
-        if type == .keyDown && keyDown {
-            holdTask?.cancel(); keyDown = false
-            if listening || starting { captureID = UUID(); model.cancelRecording(); listening = false; panel?.orderOut(nil) }
-            return
-        }
-        guard type == .flagsChanged, code == Int64(kVK_RightCommand) else { return }
-        if rightDown && !keyDown {
-            keyDown = true
-            holdTask?.cancel()
-            holdTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                guard !Task.isCancelled, let self, self.keyDown else { return }
-                await self.beginHold()
-            }
-        } else if !rightDown && keyDown {
-            keyDown = false
-            if starting { releasedWhileStarting = true }
-            else { holdTask?.cancel() }
-            if listening { listening = false; showReview(); Task { await model.stop() } }
-        }
-    }
-    func beginHold() async {
+    func openAndRecord() {
+        settingsVisible = false
+        showReview()
         guard !model.busy, !model.recording, !starting else { return }
-        let id = UUID(); captureID = id; starting = true; releasedWhileStarting = false
-        showPanel(compact: true, activate: false)
-        await model.start(); starting = false
-        guard captureID == id else { model.cancelRecording(); panel?.orderOut(nil); return }
-        if model.recording && releasedWhileStarting {
-            model.cancelRecording()
-            model.status = "Microphone started after you released the key. Hold it a little longer and try again."
-            showReview()
-        } else if model.recording && keyDown { listening = true }
-        else if model.recording { model.cancelRecording(); panel?.orderOut(nil) }
-        else { showReview() }
+        let id = UUID(); captureID = id; starting = true
+        Task {
+            await model.start(); starting = false
+            guard captureID == id else { model.cancelRecording(); return }
+            listening = model.recording
+        }
+    }
+    func stopRecording() {
+        guard listening && model.recording else { return }
+        listening = false
+        Task { await model.stop() }
     }
     func showPanel(compact: Bool, activate: Bool) {
         if panel == nil {
@@ -277,12 +212,11 @@ final class FloatingCapturePanel: NSPanel {
         if activate { NSApp.activate(ignoringOtherApps: true); p.makeKeyAndOrderFront(nil) } else { p.orderFrontRegardless() }
     }
     func showReview() { showPanel(compact: false, activate: true) }
-    func dismiss() { captureID = UUID(); keyDown = false; holdTask?.cancel(); model.cancelRecording(); listening = false; panel?.orderOut(nil) }
+    func dismiss() { captureID = UUID(); model.cancelRecording(); listening = false; panel?.orderOut(nil) }
     func windowWillClose(_ notification: Notification) { dismiss() }
     func windowDidResignKey(_ notification: Notification) {
-        guard !listening && !starting else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self, let panel = self.panel, !panel.isKeyWindow, !NSApp.isActive, !self.listening, !self.starting, !self.keyDown else { return }
+            guard let self, let panel = self.panel, !panel.isKeyWindow, !NSApp.isActive else { return }
             self.dismiss()
         }
     }
@@ -297,7 +231,7 @@ final class FloatingCapturePanel: NSPanel {
         item.button?.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Voice Tasks")
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Open Voice Tasks", action: #selector(openPanel), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Enable Right Command", action: #selector(enableShortcut), keyEquivalent: ""))
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Voice Tasks", action: #selector(quitApp), keyEquivalent: "q"))
         for menuItem in menu.items { menuItem.target = self }
@@ -310,10 +244,9 @@ final class FloatingCapturePanel: NSPanel {
     @objc func statusClicked(_ sender: NSStatusBarButton) {
         if NSApp.currentEvent?.type == .rightMouseUp {
             statusMenu?.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 3), in: sender)
-        } else { controller.showReview() }
+        } else { controller.openAndRecord() }
     }
     @objc func openPanel() { controller.showReview() }
-    @objc func enableShortcut() { controller.setupMonitor(request: true) }
     @objc func quitApp() { controller.dismiss(); NSApp.terminate(nil) }
 }
 @main struct VoiceTasksMacApp: App {
@@ -329,22 +262,9 @@ struct CapturePanel: View {
     init(controller: CaptureController) { self.controller = controller; self.model = controller.model }
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if controller.listening {
-                HStack(spacing: 14) {
-                    Image(systemName: "waveform").font(.system(size: 23, weight: .semibold)).foregroundStyle(coral)
-                        .frame(width: 46, height: 46).background(coral.opacity(0.13), in: RoundedRectangle(cornerRadius: 14))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Listening").font(.system(size: 15, weight: .semibold))
-                        Text("Release ⌘ to review").font(.system(size: 12)).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Circle().fill(coral).frame(width: 7, height: 7)
-                }.padding(.horizontal, 20).frame(maxHeight: .infinity)
-            } else {
-                header
-                if controller.settingsVisible { settings }
-                else { review }
-            }
+            header
+            if controller.settingsVisible { settings }
+            else { review }
         }
         .foregroundStyle(Color.white.opacity(0.93))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -365,8 +285,6 @@ struct CapturePanel: View {
     }
     private var settings: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack { Image(systemName: controller.shortcutStatus == "Right Command is ready" ? "checkmark.circle.fill" : "exclamationmark.circle"); Text(controller.shortcutStatus).font(.caption); Spacer(); Button("Retry") { controller.setupMonitor(request: true) } }
-                .foregroundStyle(.secondary)
             Toggle("Open at login", isOn: Binding(get: { controller.launchAtLogin }, set: { controller.configureLogin($0) }))
             if !controller.loginMessage.isEmpty { Text(controller.loginMessage).font(.caption).foregroundStyle(.secondary) }
             Picker("Task app", selection: Binding(get: { model.service }, set: { model.switchService($0) })) { ForEach(TaskService.allCases) { Text($0.rawValue).tag($0) } }
@@ -381,9 +299,12 @@ struct CapturePanel: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
+                    if controller.listening {
+                        HStack(spacing: 10) { Circle().fill(coral).frame(width: 8, height: 8); Text("Listening…").font(.headline); Spacer() }.padding(.vertical, 12)
+                    }
                     if model.busy { HStack(spacing: 9) { ProgressView().controlSize(.small); Text(model.status).foregroundStyle(.secondary) }.padding(.vertical, 10) }
-                    if model.tasks.isEmpty && !model.busy && model.status == "Ready to capture" {
-                        Text("Hold Right Command to speak").foregroundStyle(.secondary).padding(.vertical, 16)
+                    if model.tasks.isEmpty && !model.busy && !controller.listening && model.status == "Ready to capture" {
+                        Text("Click the menu-bar icon to start recording.").foregroundStyle(.secondary).padding(.vertical, 16)
                     }
                     ForEach($model.tasks) { $item in
                         MacTaskRow(item: $item, projects: model.projects) { model.tasks.removeAll { $0.id == item.id } }
@@ -393,14 +314,18 @@ struct CapturePanel: View {
                     if !model.busy && model.status != "Ready to capture" && model.status != "Review your tasks before adding." { Text(model.status).foregroundStyle(.secondary).font(.caption) }
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 18).padding(.bottom, 12)
             }
-            if !model.tasks.isEmpty {
-                HStack {
-                    Label(model.service.rawValue, systemImage: "tray").font(.caption).foregroundStyle(.secondary)
-                    Spacer()
+            HStack {
+                Label(model.service.rawValue, systemImage: "tray").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if controller.listening {
+                    Button("Stop & review") { controller.stopRecording() }.buttonStyle(.borderedProminent).tint(coral)
+                } else if !model.tasks.isEmpty {
                     Button("Add tasks") { Task { await model.send(); if model.tasks.isEmpty && model.status.hasPrefix("Added") { controller.dismiss() } } }
                         .buttonStyle(.borderedProminent).tint(coral).disabled(model.busy || model.tasks.contains { $0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
-                }.padding(.horizontal, 18).padding(.vertical, 14).background(.white.opacity(0.025))
-            }
+                } else if !model.busy {
+                    Button("Start recording") { controller.openAndRecord() }.buttonStyle(.borderedProminent).tint(coral)
+                }
+            }.padding(.horizontal, 18).padding(.vertical, 14).background(.white.opacity(0.025))
         }
     }
 }
