@@ -248,6 +248,7 @@ final class FloatingCapturePanel: NSPanel {
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     let controller = CaptureController()
     var statusItem: NSStatusItem?
+    private var statusMenu: NSMenu?
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -257,8 +258,17 @@ final class FloatingCapturePanel: NSPanel {
         menu.addItem(NSMenuItem(title: "Enable Right Command", action: #selector(enableShortcut), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Voice Tasks", action: #selector(quitApp), keyEquivalent: "q"))
-        for menuItem in menu.items { menuItem.target = self }; item.menu = menu; statusItem = item
+        for menuItem in menu.items { menuItem.target = self }
+        statusMenu = menu; statusItem = item
+        item.button?.target = self
+        item.button?.action = #selector(statusClicked(_:))
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         controller.setup()
+    }
+    @objc func statusClicked(_ sender: NSStatusBarButton) {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            statusMenu?.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 3), in: sender)
+        } else { controller.showReview() }
     }
     @objc func openPanel() { controller.showReview() }
     @objc func enableShortcut() { controller.setupMonitor(request: true) }
