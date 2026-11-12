@@ -205,7 +205,7 @@ enum Vault {
             }
         } else if !rightDown && keyDown {
             keyDown = false; holdTask?.cancel()
-            if listening { listening = false; Task { await model.stop(); showReview() } }
+            if listening { listening = false; showReview(); Task { await model.stop() } }
         }
     }
     func beginHold() async {
