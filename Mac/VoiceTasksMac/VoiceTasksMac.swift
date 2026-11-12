@@ -180,6 +180,7 @@ final class FloatingCapturePanel: NSPanel {
     private var eventTap: CFMachPort?
     private var keyDown = false
     private var starting = false
+    private var releasedWhileStarting = false
     private var holdTask: Task<Void, Never>?
     private var captureID = UUID()
 
@@ -220,22 +221,29 @@ final class FloatingCapturePanel: NSPanel {
             keyDown = true
             holdTask?.cancel()
             holdTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 350_000_000)
+                try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled, let self, self.keyDown else { return }
                 await self.beginHold()
             }
         } else if !rightDown && keyDown {
-            keyDown = false; holdTask?.cancel()
+            keyDown = false
+            if starting { releasedWhileStarting = true }
+            else { holdTask?.cancel() }
             if listening { listening = false; showReview(); Task { await model.stop() } }
         }
     }
     func beginHold() async {
         guard !model.busy, !model.recording, !starting else { return }
-        let id = UUID(); captureID = id; starting = true
+        let id = UUID(); captureID = id; starting = true; releasedWhileStarting = false
         showPanel(compact: true, activate: false)
         await model.start(); starting = false
-        guard captureID == id, keyDown else { model.cancelRecording(); panel?.orderOut(nil); return }
-        if model.recording { listening = true }
+        guard captureID == id else { model.cancelRecording(); panel?.orderOut(nil); return }
+        if model.recording && releasedWhileStarting {
+            model.cancelRecording()
+            model.status = "Microphone started after you released the key. Hold it a little longer and try again."
+            showReview()
+        } else if model.recording && keyDown { listening = true }
+        else if model.recording { model.cancelRecording(); panel?.orderOut(nil) }
         else { showReview() }
     }
     func showPanel(compact: Bool, activate: Bool) {
