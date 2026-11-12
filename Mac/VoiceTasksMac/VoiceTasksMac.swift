@@ -90,7 +90,7 @@ enum Vault {
         do {
             recorder = try AVAudioRecorder(url: file, settings: [AVFormatIDKey: Int(kAudioFormatMPEG4AAC), AVSampleRateKey: 16000, AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 32000])
             guard recorder?.record() == true else { throw NSError(domain: "Recording could not start", code: 1) }
-            recording = true; status = "Listening…"; tasks = []; transcript = ""
+            recording = true; status = "Listening…"
         } catch { status = error.localizedDescription }
     }
     func cancelRecording() {
@@ -109,14 +109,14 @@ enum Vault {
             field("model", "whisper-large-v3"); field("language", "en"); field("prompt", vocabulary)
             body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"recording.m4a\"\r\nContent-Type: audio/mp4\r\n\r\n".utf8)); body.append(try Data(contentsOf: file)); body.append(Data("\r\n--\(boundary)--\r\n".utf8))
             var req = URLRequest(url: URL(string: "https://api.groq.com/openai/v1/audio/transcriptions")!); req.httpMethod = "POST"; req.setValue("Bearer \(groq)", forHTTPHeaderField: "Authorization"); req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type"); req.httpBody = body
-            let data = try await request(req); let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]; transcript = obj?["text"] as? String ?? ""
-            guard !transcript.isEmpty else { throw NSError(domain: "No speech was recognized", code: 1) }
+            let data = try await request(req); let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]; let currentTranscript = obj?["text"] as? String ?? ""
+            guard !currentTranscript.isEmpty else { throw NSError(domain: "No speech was recognized", code: 1) }
             status = "Finding tasks…"
             let now = ISO8601DateFormatter().string(from: Date())
-            let prompt = "Extract actionable tasks from the transcript. Preserve Sri Lankan names and local words. Apply spoken corrections. Current date/time: \(now). User timezone: \(TimeZone.current.identifier). Output only JSON object with tasks array. Each task has content, optional description, and optional due_string. Use YYYY-MM-DD for date-only and ISO 8601 date-time with timezone offset for an explicitly stated time. Include dates only if explicitly specified. Do not invent tasks or dates. Transcript: \(transcript)"
+            let prompt = "Extract actionable tasks from the transcript. Preserve Sri Lankan names and local words. Apply spoken corrections. Current date/time: \(now). User timezone: \(TimeZone.current.identifier). Output only JSON object with tasks array. Each task has content, optional description, and optional due_string. Use YYYY-MM-DD for date-only and ISO 8601 date-time with timezone offset for an explicitly stated time. Include dates only if explicitly specified. Do not invent tasks or dates. Transcript: \(currentTranscript)"
             var chat = URLRequest(url: URL(string: "https://api.groq.com/openai/v1/chat/completions")!); chat.httpMethod = "POST"; chat.setValue("Bearer \(groq)", forHTTPHeaderField: "Authorization"); chat.setValue("application/json", forHTTPHeaderField: "Content-Type"); chat.httpBody = try JSONSerialization.data(withJSONObject: ["model":"openai/gpt-oss-120b", "messages":[["role":"user", "content":prompt]], "response_format":["type":"json_object"], "temperature":0])
             let result = try await request(chat); let parsed = try JSONSerialization.jsonObject(with: result) as? [String: Any]; let choices = parsed?["choices"] as? [[String: Any]]; let message = choices?.first?["message"] as? [String: Any]; guard let content = message?["content"] as? String, let json = content.data(using: .utf8) else { throw NSError(domain: "Could not read AI response", code: 1) }
-            struct Result: Decodable { let tasks: [TaskItem] }; tasks = try JSONDecoder().decode(Result.self, from: json).tasks; status = tasks.isEmpty ? "No tasks found." : "Review your tasks before adding."
+            struct Result: Decodable { let tasks: [TaskItem] }; let newTasks = try JSONDecoder().decode(Result.self, from: json).tasks; tasks.append(contentsOf: newTasks); transcript = [transcript, currentTranscript].filter { !$0.isEmpty }.joined(separator: "\n\n"); status = newTasks.isEmpty ? "No tasks found in that recording." : "Review your tasks before adding."
         } catch { status = "Error: \(error.localizedDescription)" }
     }
     func request(_ req: URLRequest) async throws -> Data {
@@ -215,7 +215,6 @@ final class FloatingCapturePanel: NSPanel {
     }
     func beginHold() async {
         guard !model.busy, !model.recording, !starting else { return }
-        guard model.tasks.isEmpty else { keyDown = false; showReview(); return }
         let id = UUID(); captureID = id; starting = true
         showPanel(compact: true, activate: false)
         await model.start(); starting = false
@@ -241,7 +240,7 @@ final class FloatingCapturePanel: NSPanel {
     func windowDidResignKey(_ notification: Notification) {
         guard !listening && !starting else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self, let panel = self.panel, !panel.isKeyWindow, !NSApp.isActive, !self.listening else { return }
+            guard let self, let panel = self.panel, !panel.isKeyWindow, !NSApp.isActive, !self.listening, !self.starting, !self.keyDown else { return }
             self.dismiss()
         }
     }
