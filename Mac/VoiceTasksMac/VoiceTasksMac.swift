@@ -152,6 +152,11 @@ enum Vault {
 
 }
 
+final class FloatingCapturePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 @MainActor final class CaptureController: NSObject, ObservableObject, NSWindowDelegate {
     let model = Model()
     @Published var listening = false
@@ -220,19 +225,26 @@ enum Vault {
     }
     func showPanel(compact: Bool, activate: Bool) {
         if panel == nil {
-            let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 130), styleMask: [.titled, .closable, .fullSizeContentView, .nonactivatingPanel], backing: .buffered, defer: false)
-            p.titleVisibility = .hidden; p.titlebarAppearsTransparent = true; p.isFloatingPanel = true; p.level = .floating; p.isReleasedWhenClosed = false
+            let p = FloatingCapturePanel(contentRect: NSRect(x: 0, y: 0, width: 430, height: 100), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true; p.isFloatingPanel = true; p.level = .floating; p.isReleasedWhenClosed = false; p.hidesOnDeactivate = false
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]; p.delegate = self
             p.contentView = NSHostingView(rootView: CapturePanel(controller: self)); panel = p
         }
         guard let p = panel, let screen = NSScreen.main else { return }
-        let visible = screen.visibleFrame; let width: CGFloat = min(480, visible.width - 24); let height: CGFloat = compact ? 130 : min(590, visible.height - 40)
+        let visible = screen.visibleFrame; let width: CGFloat = min(440, visible.width - 24); let height: CGFloat = compact ? 92 : min(390, visible.height - 40)
         p.setFrame(NSRect(x: visible.midX - width / 2, y: visible.minY + 24, width: width, height: height), display: true, animate: true)
         if activate { NSApp.activate(ignoringOtherApps: true); p.makeKeyAndOrderFront(nil) } else { p.orderFrontRegardless() }
     }
     func showReview() { showPanel(compact: false, activate: true) }
     func dismiss() { captureID = UUID(); keyDown = false; holdTask?.cancel(); model.cancelRecording(); listening = false; panel?.orderOut(nil) }
     func windowWillClose(_ notification: Notification) { dismiss() }
+    func windowDidResignKey(_ notification: Notification) {
+        guard !listening && !starting else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, let panel = self.panel, !panel.isKeyWindow, !NSApp.isActive, !self.listening else { return }
+            self.dismiss()
+        }
+    }
 }
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     let controller = CaptureController()
@@ -260,50 +272,130 @@ enum Vault {
 struct CapturePanel: View {
     @ObservedObject var controller: CaptureController
     @ObservedObject var model: Model
+    private let background = Color(red: 0.11, green: 0.11, blue: 0.13)
+    private let card = Color(red: 0.16, green: 0.16, blue: 0.18)
+    private let coral = Color(red: 0.96, green: 0.42, blue: 0.35)
     init(controller: CaptureController) { self.controller = controller; self.model = controller.model }
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Image(systemName: controller.listening ? "waveform" : "checklist").foregroundStyle(.orange)
-                Text(controller.listening ? "Listening…" : "Voice Tasks").font(.headline)
-                Spacer()
-                if !controller.listening { Button("Settings") { controller.settingsVisible.toggle() }.buttonStyle(.borderless); Button { controller.dismiss() } label: { Image(systemName: "xmark") }.buttonStyle(.borderless) }
-            }
+        VStack(alignment: .leading, spacing: 0) {
             if controller.listening {
-                Text("Release Right Command to create tasks").foregroundStyle(.secondary).font(.subheadline)
-            } else if controller.settingsVisible {
-                VStack(spacing: 10) {
-                    Picker("Task app", selection: Binding(get: { model.service }, set: { model.switchService($0) })) { ForEach(TaskService.allCases) { Text($0.rawValue).tag($0) } }
-                    SecureField("Groq API key", text: $model.groq)
-                    SecureField("Todoist API token", text: $model.todoist)
-                    SecureField("TickTick API token", text: $model.ticktick)
-                    TextField("Names and local words", text: $model.vocabulary)
-                    Button("Save") { model.saveSettings(); controller.settingsVisible = false; Task { await model.loadProjects() } }.buttonStyle(.borderedProminent)
-                }
-            } else {
-                ScrollView { VStack(alignment: .leading, spacing: 10) {
-                    if model.busy { HStack { ProgressView().controlSize(.small); Text(model.status) } }
-                    if !model.transcript.isEmpty { DisclosureGroup("What you said") { Text(model.transcript).textSelection(.enabled) } }
-                    ForEach($model.tasks) { $item in
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack { TextField("Task", text: $item.content); Button { model.tasks.removeAll { $0.id == item.id } } label: { Image(systemName: "xmark") }.buttonStyle(.plain) }
-                            TextField("Description", text: Binding(get: { item.description ?? "" }, set: { item.description = $0.isEmpty ? nil : $0 }))
-                            HStack {
-                                TextField("Due date (YYYY-MM-DD)", text: Binding(get: { item.due_string ?? "" }, set: { item.due_string = $0.isEmpty ? nil : $0 }))
-                                Picker("List", selection: Binding(get: { item.project_id ?? "" }, set: { item.project_id = $0.isEmpty ? nil : $0 })) { Text("Inbox").tag(""); ForEach(model.projects) { Text($0.name).tag($0.id) } }.labelsHidden().frame(width: 120)
-                            }
-                        }.padding(12).background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+                HStack(spacing: 14) {
+                    Image(systemName: "waveform").font(.system(size: 23, weight: .semibold)).foregroundStyle(coral)
+                        .frame(width: 46, height: 46).background(coral.opacity(0.13), in: RoundedRectangle(cornerRadius: 14))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Listening").font(.system(size: 15, weight: .semibold))
+                        Text("Release ⌘ to review").font(.system(size: 12)).foregroundStyle(.secondary)
                     }
-                    if !model.projectsStatus.isEmpty { HStack { Text(model.projectsStatus); Button("Retry") { Task { await model.loadProjects() } } }.font(.caption) }
-                    if !model.busy && model.status != "Ready to capture" { Text(model.status).foregroundStyle(.secondary).font(.caption) }
-                }.frame(maxWidth: .infinity, alignment: .leading) }
-                HStack {
-                    Text(model.tasks.isEmpty ? "Hold Right Command to speak" : "Review your tasks").font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    if !model.tasks.isEmpty { Button("Add tasks") { Task { await model.send(); if model.tasks.isEmpty && model.status.hasPrefix("Added") { controller.dismiss() } } }.buttonStyle(.borderedProminent).disabled(model.busy) }
-                }
+                    Circle().fill(coral).frame(width: 7, height: 7)
+                }.padding(.horizontal, 20).frame(maxHeight: .infinity)
+            } else {
+                header
+                if controller.settingsVisible { settings }
+                else { review }
             }
-        }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .foregroundStyle(Color.white.opacity(0.93))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(background, in: RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(.white.opacity(0.1)))
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+        .preferredColorScheme(.dark)
+    }
+    private var header: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "waveform").foregroundStyle(coral).font(.system(size: 15, weight: .bold))
+            Text(controller.settingsVisible ? "Settings" : "Voice Tasks").font(.system(size: 14, weight: .semibold))
+            Spacer()
+            Button { controller.settingsVisible.toggle() } label: { Image(systemName: controller.settingsVisible ? "chevron.left" : "gearshape") }
+                .buttonStyle(.plain).foregroundStyle(.secondary).help(controller.settingsVisible ? "Back" : "Settings")
+            Button { controller.dismiss() } label: { Image(systemName: "xmark") }.buttonStyle(.plain).foregroundStyle(.secondary).help("Hide")
+        }.padding(.horizontal, 18).padding(.top, 16).padding(.bottom, 13)
+    }
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("Task app", selection: Binding(get: { model.service }, set: { model.switchService($0) })) { ForEach(TaskService.allCases) { Text($0.rawValue).tag($0) } }
+            SecureField("Groq API key", text: $model.groq)
+            SecureField("Todoist API token", text: $model.todoist)
+            SecureField("TickTick API token", text: $model.ticktick)
+            TextField("Names and local words", text: $model.vocabulary)
+            HStack { Spacer(); Button("Save settings") { model.saveSettings(); controller.settingsVisible = false; Task { await model.loadProjects() } }.buttonStyle(.borderedProminent).tint(coral) }
+        }.padding(.horizontal, 18).padding(.bottom, 18)
+    }
+    private var review: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if model.busy { HStack(spacing: 9) { ProgressView().controlSize(.small); Text(model.status).foregroundStyle(.secondary) }.padding(.vertical, 10) }
+                    if model.tasks.isEmpty && !model.busy && model.status == "Ready to capture" {
+                        Text("Hold Right Command to speak").foregroundStyle(.secondary).padding(.vertical, 16)
+                    }
+                    ForEach($model.tasks) { $item in
+                        MacTaskRow(item: $item, projects: model.projects) { model.tasks.removeAll { $0.id == item.id } }
+                    }
+                    if !model.transcript.isEmpty { DisclosureGroup("What you said") { Text(model.transcript).textSelection(.enabled).font(.caption).foregroundStyle(.secondary).padding(.top, 5) }.font(.caption).foregroundStyle(.secondary).padding(.top, 4) }
+                    if !model.projectsStatus.isEmpty { HStack { Text(model.projectsStatus); Button("Retry") { Task { await model.loadProjects() } } }.font(.caption).foregroundStyle(.secondary) }
+                    if !model.busy && model.status != "Ready to capture" && model.status != "Review your tasks before adding." { Text(model.status).foregroundStyle(.secondary).font(.caption) }
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 18).padding(.bottom, 12)
+            }
+            if !model.tasks.isEmpty {
+                HStack {
+                    Label(model.service.rawValue, systemImage: "tray").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Add tasks") { Task { await model.send(); if model.tasks.isEmpty && model.status.hasPrefix("Added") { controller.dismiss() } } }
+                        .buttonStyle(.borderedProminent).tint(coral).disabled(model.busy || model.tasks.contains { $0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+                }.padding(.horizontal, 18).padding(.vertical, 14).background(.white.opacity(0.025))
+            }
+        }
+    }
+}
+struct MacTaskRow: View {
+    @Binding var item: TaskItem
+    let projects: [TodoistProject]
+    let remove: () -> Void
+    @State private var editingDate = false
+    @State private var showDescription = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: "circle").foregroundStyle(.secondary).padding(.top, 2)
+                TextField("Task", text: $item.content, axis: .vertical).textFieldStyle(.plain).font(.system(size: 14, weight: .medium))
+                Button(action: remove) { Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)) }.buttonStyle(.plain).foregroundStyle(.secondary).help("Remove task")
+            }
+            if showDescription || !(item.description ?? "").isEmpty {
+                TextField("Add description", text: Binding(get: { item.description ?? "" }, set: { item.description = $0.isEmpty ? nil : $0 }), axis: .vertical).textFieldStyle(.plain).font(.caption).padding(.leading, 23)
+            }
+            HStack(spacing: 7) {
+                Button { editingDate = true } label: { Label(DateHelper.label(item.due_string), systemImage: "calendar") }
+                    .popover(isPresented: $editingDate) { MacDateEditor(value: $item.due_string) }
+                Menu {
+                    Button("Inbox") { item.project_id = nil }
+                    ForEach(projects) { project in Button(project.name) { item.project_id = project.id } }
+                } label: { Label(projects.first(where: { $0.id == item.project_id })?.name ?? "Inbox", systemImage: "tray") }
+                Spacer()
+                if !showDescription && (item.description ?? "").isEmpty { Button { showDescription = true } label: { Image(systemName: "text.alignleft") }.help("Add description") }
+            }.font(.caption).buttonStyle(.borderless).foregroundStyle(Color.white.opacity(0.65)).padding(.leading, 23)
+        }.padding(14).background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 13))
+    }
+}
+struct MacDateEditor: View {
+    @Binding var value: String?
+    @Environment(\.dismiss) private var dismiss
+    @State private var date = Date()
+    @State private var hasTime = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Due date").font(.headline)
+            DatePicker("Date", selection: $date, displayedComponents: .date)
+            Toggle("Add time", isOn: $hasTime)
+            if hasTime { DatePicker("Time", selection: $date, displayedComponents: .hourAndMinute) }
+            HStack {
+                if value != nil { Button("Remove") { value = nil; dismiss() } }
+                Spacer(); Button("Cancel") { dismiss() }
+                Button("Done") { value = DateHelper.encode(date, timed: hasTime); dismiss() }.buttonStyle(.borderedProminent)
+            }
+        }.padding(16).frame(width: 290)
+            .onAppear { if let existing = DateHelper.parse(value) { date = existing; hasTime = DateHelper.hasTime(value) } }
     }
 }
 

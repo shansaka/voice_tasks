@@ -12,7 +12,7 @@ Open `Mac/VoiceTasksMac.xcodeproj`, select My Mac, and press Run. The app runs i
 
 Press and hold **Right Command** to show the small listening panel. Release it to transcribe and review tasks. Use Add tasks after reviewing. The first microphone permission prompt can interrupt the initial attempt, so grant it and try again. The app must be running for the key to work. A brief press is ignored; pressing another key while holding Right Command cancels the capture so ordinary shortcuts can continue. This is a listen-only key monitor; macOS still sends key events to other apps.
 
-The Mac version is a prototype: the hold gesture, floating panel, and microphone need testing on a real Mac; date editing currently uses a text field. TickTick Inbox defaults and all-day dates also need live-account testing. Closing the panel discards any unfinished recording. Use the menu-bar item to quit the app.
+The Mac version is a prototype: the hold gesture, floating panel, and microphone need testing on a real Mac; dates can be edited from the task card. TickTick Inbox defaults and all-day dates also need live-account testing. The review panel hides when you switch to another app and retains unadded tasks; closing the panel discards any unfinished recording. Use the menu-bar item to quit the app.
 
 ## Tokens
 
