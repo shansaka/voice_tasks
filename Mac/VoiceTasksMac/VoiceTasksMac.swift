@@ -152,82 +152,158 @@ enum Vault {
 
 }
 
-@MainActor final class AppCoordinator: ObservableObject {
+@MainActor final class CaptureController: NSObject, ObservableObject, NSWindowDelegate {
     let model = Model()
-    @Published var showSettings = false
-    func capture() { NSApp.activate(ignoringOtherApps: true); if !model.recording && !model.busy && model.tasks.isEmpty { Task { await model.start() } } }
-}
-final class HotKey {
-    var ref: EventHotKeyRef?
-    var handler: EventHandlerRef?
-    init(action: @escaping () -> Void) {
-        let ptr = Unmanaged.passRetained(HotKeyAction(action)).toOpaque()
-        var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
-            guard let userData else { return noErr }; let box = Unmanaged<HotKeyAction>.fromOpaque(userData).takeUnretainedValue()
-            DispatchQueue.main.async { box.action() }; return noErr
-        }, 1, &event, ptr, &handler)
-        RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey), EventHotKeyID(signature: 0x5654534B, id: 1), GetApplicationEventTarget(), 0, &ref)
+    @Published var listening = false
+    @Published var settingsVisible = false
+    private var panel: NSPanel?
+    private var eventTap: CFMachPort?
+    private var keyDown = false
+    private var starting = false
+    private var holdTask: Task<Void, Never>?
+    private var captureID = UUID()
+
+    func setup() {
+        Task { await model.loadProjects() }
+        setupMonitor(request: true)
     }
-}
-final class HotKeyAction { let action: () -> Void; init(_ action: @escaping () -> Void) { self.action = action } }
-@main struct VoiceTasksMacApp: App {
-    @StateObject private var app = AppCoordinator()
-    @State private var hotKey: HotKey?
-    @Environment(\.openWindow) private var openWindow
-    var body: some Scene {
-        Window("Voice Tasks", id: "main") {
-            MacView(model: app.model).frame(minWidth: 430, minHeight: 520)
-                .task { await app.model.loadProjects(); if hotKey == nil { hotKey = HotKey { openWindow(id: "main"); app.capture() } } }
-        }.defaultSize(width: 480, height: 650)
-        MenuBarExtra("Voice Tasks", systemImage: "waveform") {
-            Button("Start recording   ⌃⌥Space") { openWindow(id: "main"); app.capture() }
-            Button("Open Voice Tasks") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
-            Divider()
-            Button("Quit Voice Tasks") { app.model.cancelRecording(); NSApp.terminate(nil) }.keyboardShortcut("q")
+    func setupMonitor(request: Bool) {
+        if let tap = eventTap, CFMachPortIsValid(tap) { CGEvent.tapEnable(tap: tap, enable: true); return }
+        if request && !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
+        let mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
+        let pointer = Unmanaged.passUnretained(self).toOpaque()
+        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly, eventsOfInterest: CGEventMask(mask), callback: { _, type, event, info in
+            guard let info else { return Unmanaged.passUnretained(event) }
+            let controller = Unmanaged<CaptureController>.fromOpaque(info).takeUnretainedValue()
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            let rightDown = (event.flags.rawValue & 0x10) != 0
+            DispatchQueue.main.async { controller.keyEvent(type: type, code: code, rightDown: rightDown) }
+            return Unmanaged.passUnretained(event)
+        }, userInfo: pointer) else { return }
+        eventTap = tap
+        CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+    func keyEvent(type: CGEventType, code: Int64, rightDown: Bool) {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            holdTask?.cancel(); keyDown = false; captureID = UUID(); model.cancelRecording(); listening = false; panel?.orderOut(nil)
+            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }; return
         }
-    }
-}
-struct MacView: View {
-    @ObservedObject var model: Model
-    @State private var settings = false
-    var body: some View {
-        VStack(spacing: 14) {
-            HStack {
-                Picker("Task app", selection: Binding(get: { model.service }, set: { model.switchService($0) })) { ForEach(TaskService.allCases) { Text($0.rawValue).tag($0) } }.frame(width: 160).disabled(model.busy || model.recording)
-                Spacer()
-                Button("Settings") { settings = true }
+        if type == .keyDown && keyDown {
+            holdTask?.cancel(); keyDown = false
+            if listening || starting { captureID = UUID(); model.cancelRecording(); listening = false; panel?.orderOut(nil) }
+            return
+        }
+        guard type == .flagsChanged, code == Int64(kVK_RightCommand) else { return }
+        if rightDown && !keyDown {
+            keyDown = true
+            holdTask?.cancel()
+            holdTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                guard !Task.isCancelled, let self, self.keyDown else { return }
+                await self.beginHold()
             }
-            ScrollView { VStack(alignment: .leading, spacing: 12) {
-                if !model.transcript.isEmpty { DisclosureGroup("What you said") { Text(model.transcript).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) } }
-                ForEach($model.tasks) { $item in
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack { TextField("Task", text: $item.content); Button { model.tasks.removeAll { $0.id == item.id } } label: { Image(systemName: "xmark") }.buttonStyle(.plain) }
-                        TextField("Description", text: Binding(get: { item.description ?? "" }, set: { item.description = $0.isEmpty ? nil : $0 }))
-                        HStack {
-                            TextField("Due date (YYYY-MM-DD or date and time)", text: Binding(get: { item.due_string ?? "" }, set: { item.due_string = $0.isEmpty ? nil : $0 }))
-                            Picker("List", selection: Binding(get: { item.project_id ?? "" }, set: { item.project_id = $0.isEmpty ? nil : $0 })) { Text("Inbox").tag(""); ForEach(model.projects) { Text($0.name).tag($0.id) } }.labelsHidden().frame(width: 130)
-                        }
-                    }.padding(12).background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
-                }
-                if !model.projectsStatus.isEmpty { HStack { Text(model.projectsStatus); Button("Retry") { Task { await model.loadProjects() } } }.font(.caption) }
-                if model.status != "Ready to capture" { Text(model.status).font(.caption).foregroundStyle(.secondary) }
-            }.frame(maxWidth: .infinity, alignment: .leading) }
-            HStack {
-                Button(model.recording ? "Stop and process" : "Start speaking") { Task { if model.recording { await model.stop() } else { await model.start() } } }.disabled(model.busy || (!model.tasks.isEmpty && !model.recording))
-                if !model.tasks.isEmpty { Button("Add tasks") { Task { await model.send() } }.disabled(model.busy).buttonStyle(.borderedProminent) }
-            }.controlSize(.large)
-        }.padding(20).sheet(isPresented: $settings) {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Settings").font(.title2.bold())
-                SecureField("Groq API key", text: $model.groq)
-                SecureField("Todoist API token", text: $model.todoist)
-                SecureField("TickTick API token", text: $model.ticktick)
-                TextField("Names and local words", text: $model.vocabulary)
-                HStack { Spacer(); Button("Done") { model.saveSettings(); settings = false; Task { await model.loadProjects() } }.keyboardShortcut(.defaultAction) }
-            }.padding(24).frame(width: 440)
+        } else if !rightDown && keyDown {
+            keyDown = false; holdTask?.cancel()
+            if listening { listening = false; Task { await model.stop(); showReview() } }
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { _ in model.cancelRecording() }
+    }
+    func beginHold() async {
+        guard !model.busy, !model.recording, !starting else { return }
+        guard model.tasks.isEmpty else { keyDown = false; showReview(); return }
+        let id = UUID(); captureID = id; starting = true
+        showPanel(compact: true, activate: false)
+        await model.start(); starting = false
+        guard captureID == id, keyDown else { model.cancelRecording(); panel?.orderOut(nil); return }
+        if model.recording { listening = true }
+        else { showReview() }
+    }
+    func showPanel(compact: Bool, activate: Bool) {
+        if panel == nil {
+            let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 130), styleMask: [.titled, .closable, .fullSizeContentView, .nonactivatingPanel], backing: .buffered, defer: false)
+            p.titleVisibility = .hidden; p.titlebarAppearsTransparent = true; p.isFloatingPanel = true; p.level = .floating; p.isReleasedWhenClosed = false
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]; p.delegate = self
+            p.contentView = NSHostingView(rootView: CapturePanel(controller: self)); panel = p
+        }
+        guard let p = panel, let screen = NSScreen.main else { return }
+        let visible = screen.visibleFrame; let width: CGFloat = min(480, visible.width - 24); let height: CGFloat = compact ? 130 : min(590, visible.height - 40)
+        p.setFrame(NSRect(x: visible.midX - width / 2, y: visible.minY + 24, width: width, height: height), display: true, animate: true)
+        if activate { NSApp.activate(ignoringOtherApps: true); p.makeKeyAndOrderFront(nil) } else { p.orderFrontRegardless() }
+    }
+    func showReview() { showPanel(compact: false, activate: true) }
+    func dismiss() { captureID = UUID(); keyDown = false; holdTask?.cancel(); model.cancelRecording(); listening = false; panel?.orderOut(nil) }
+    func windowWillClose(_ notification: Notification) { dismiss() }
+}
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+    let controller = CaptureController()
+    var statusItem: NSStatusItem?
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Voice Tasks")
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Open Voice Tasks", action: #selector(openPanel), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Enable Right Command", action: #selector(enableShortcut), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Voice Tasks", action: #selector(quitApp), keyEquivalent: "q"))
+        for menuItem in menu.items { menuItem.target = self }; item.menu = menu; statusItem = item
+        controller.setup()
+    }
+    @objc func openPanel() { controller.showReview() }
+    @objc func enableShortcut() { controller.setupMonitor(request: true) }
+    @objc func quitApp() { controller.dismiss(); NSApp.terminate(nil) }
+}
+@main struct VoiceTasksMacApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
+    var body: some Scene { Settings { EmptyView() } }
+}
+struct CapturePanel: View {
+    @ObservedObject var controller: CaptureController
+    @ObservedObject var model: Model
+    init(controller: CaptureController) { self.controller = controller; self.model = controller.model }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: controller.listening ? "waveform" : "checklist").foregroundStyle(.orange)
+                Text(controller.listening ? "Listening…" : "Voice Tasks").font(.headline)
+                Spacer()
+                if !controller.listening { Button("Settings") { controller.settingsVisible.toggle() }.buttonStyle(.borderless); Button { controller.dismiss() } label: { Image(systemName: "xmark") }.buttonStyle(.borderless) }
+            }
+            if controller.listening {
+                Text("Release Right Command to create tasks").foregroundStyle(.secondary).font(.subheadline)
+            } else if controller.settingsVisible {
+                VStack(spacing: 10) {
+                    Picker("Task app", selection: Binding(get: { model.service }, set: { model.switchService($0) })) { ForEach(TaskService.allCases) { Text($0.rawValue).tag($0) } }
+                    SecureField("Groq API key", text: $model.groq)
+                    SecureField("Todoist API token", text: $model.todoist)
+                    SecureField("TickTick API token", text: $model.ticktick)
+                    TextField("Names and local words", text: $model.vocabulary)
+                    Button("Save") { model.saveSettings(); controller.settingsVisible = false; Task { await model.loadProjects() } }.buttonStyle(.borderedProminent)
+                }
+            } else {
+                ScrollView { VStack(alignment: .leading, spacing: 10) {
+                    if model.busy { HStack { ProgressView().controlSize(.small); Text(model.status) } }
+                    if !model.transcript.isEmpty { DisclosureGroup("What you said") { Text(model.transcript).textSelection(.enabled) } }
+                    ForEach($model.tasks) { $item in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack { TextField("Task", text: $item.content); Button { model.tasks.removeAll { $0.id == item.id } } label: { Image(systemName: "xmark") }.buttonStyle(.plain) }
+                            TextField("Description", text: Binding(get: { item.description ?? "" }, set: { item.description = $0.isEmpty ? nil : $0 }))
+                            HStack {
+                                TextField("Due date (YYYY-MM-DD)", text: Binding(get: { item.due_string ?? "" }, set: { item.due_string = $0.isEmpty ? nil : $0 }))
+                                Picker("List", selection: Binding(get: { item.project_id ?? "" }, set: { item.project_id = $0.isEmpty ? nil : $0 })) { Text("Inbox").tag(""); ForEach(model.projects) { Text($0.name).tag($0.id) } }.labelsHidden().frame(width: 120)
+                            }
+                        }.padding(12).background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    if !model.projectsStatus.isEmpty { HStack { Text(model.projectsStatus); Button("Retry") { Task { await model.loadProjects() } } }.font(.caption) }
+                    if !model.busy && model.status != "Ready to capture" { Text(model.status).foregroundStyle(.secondary).font(.caption) }
+                }.frame(maxWidth: .infinity, alignment: .leading) }
+                HStack {
+                    Text(model.tasks.isEmpty ? "Hold Right Command to speak" : "Review your tasks").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    if !model.tasks.isEmpty { Button("Add tasks") { Task { await model.send(); if model.tasks.isEmpty && model.status.hasPrefix("Added") { controller.dismiss() } } }.buttonStyle(.borderedProminent).disabled(model.busy) }
+                }
+            }
+        }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
