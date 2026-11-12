@@ -162,6 +162,8 @@ final class FloatingCapturePanel: NSPanel {
     let model = Model()
     @Published var listening = false
     @Published var settingsVisible = false
+    @Published var shortcutStatus = "Checking keyboard access…"
+    private var monitorTimer: Timer?
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var loginMessage = ""
     func configureLogin(_ enabled: Bool) {
@@ -188,10 +190,24 @@ final class FloatingCapturePanel: NSPanel {
         if !UserDefaults.standard.bool(forKey: "loginPreferenceConfigured") { configureLogin(true) }
         Task { await model.loadProjects() }
         setupMonitor(request: true)
+        monitorTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.setupMonitor(request: false) }
+        }
     }
     func setupMonitor(request: Bool) {
-        if let tap = eventTap, CFMachPortIsValid(tap) { CGEvent.tapEnable(tap: tap, enable: true); return }
-        if request && !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
+        if let tap = eventTap, CFMachPortIsValid(tap), CGEvent.tapIsEnabled(tap: tap) {
+            shortcutStatus = "Right Command is ready"; return
+        }
+        if let tap = eventTap, CFMachPortIsValid(tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            if CGEvent.tapIsEnabled(tap: tap) { shortcutStatus = "Right Command is ready"; return }
+            CFMachPortInvalidate(tap); eventTap = nil
+        }
+        if !CGPreflightListenEventAccess() {
+            shortcutStatus = "Allow Input Monitoring for Voice Tasks in System Settings, then reopen the app."
+            if request { _ = CGRequestListenEventAccess() }
+            return
+        }
         let mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
         let pointer = Unmanaged.passUnretained(self).toOpaque()
         guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly, eventsOfInterest: CGEventMask(mask), callback: { _, type, event, info in
@@ -201,15 +217,17 @@ final class FloatingCapturePanel: NSPanel {
             let rightDown = (event.flags.rawValue & 0x10) != 0
             DispatchQueue.main.async { controller.keyEvent(type: type, code: code, rightDown: rightDown) }
             return Unmanaged.passUnretained(event)
-        }, userInfo: pointer) else { return }
+        }, userInfo: pointer) else { shortcutStatus = "Keyboard listener unavailable. Check Input Monitoring, then reopen the app."; return }
         eventTap = tap
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        shortcutStatus = CGEvent.tapIsEnabled(tap: tap) ? "Right Command is ready" : "Keyboard listener unavailable. Check Input Monitoring."
     }
     func keyEvent(type: CGEventType, code: Int64, rightDown: Bool) {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             holdTask?.cancel(); keyDown = false; captureID = UUID(); model.cancelRecording(); listening = false; panel?.orderOut(nil)
-            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }; return
+            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            setupMonitor(request: false); return
         }
         if type == .keyDown && keyDown {
             holdTask?.cancel(); keyDown = false
@@ -347,6 +365,8 @@ struct CapturePanel: View {
     }
     private var settings: some View {
         VStack(alignment: .leading, spacing: 12) {
+            HStack { Image(systemName: controller.shortcutStatus == "Right Command is ready" ? "checkmark.circle.fill" : "exclamationmark.circle"); Text(controller.shortcutStatus).font(.caption); Spacer(); Button("Retry") { controller.setupMonitor(request: true) } }
+                .foregroundStyle(.secondary)
             Toggle("Open at login", isOn: Binding(get: { controller.launchAtLogin }, set: { controller.configureLogin($0) }))
             if !controller.loginMessage.isEmpty { Text(controller.loginMessage).font(.caption).foregroundStyle(.secondary) }
             Picker("Task app", selection: Binding(get: { model.service }, set: { model.switchService($0) })) { ForEach(TaskService.allCases) { Text($0.rawValue).tag($0) } }
