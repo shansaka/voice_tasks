@@ -8,7 +8,7 @@ Open `VoiceTasks.xcodeproj`, select your Apple account in Signing & Capabilities
 
 ## Mac
 
-Open `Mac/VoiceTasksMac.xcodeproj`, select My Mac, and press Run. The app runs in the menu bar. From its waveform menu choose Open Voice Tasks, open Settings, and enter a Groq key and the token for your task app. Grant Microphone and Input Monitoring permissions if macOS asks; Input Monitoring is needed to detect the Right Command key across apps. After granting permission, quit and reopen the app or choose Enable Right Command from its menu.
+Open `Mac/VoiceTasksMac.xcodeproj`, select My Mac, and press Run. The app runs in the menu bar and requests launch at login the first time it runs. You can change this in the app Settings or macOS Login Items & Extensions. From its waveform menu choose Open Voice Tasks, open Settings, and enter a Groq key and the token for your task app. Grant Microphone and Input Monitoring permissions if macOS asks; Input Monitoring is needed to detect the Right Command key across apps. After granting permission, quit and reopen the app or choose Enable Right Command from its menu.
 
 Press and hold **Right Command** to show the small listening panel. Release it to transcribe and review tasks. Use Add tasks after reviewing. The first microphone permission prompt can interrupt the initial attempt, so grant it and try again. The app must be running for the key to work. A brief press is ignored; pressing another key while holding Right Command cancels the capture so ordinary shortcuts can continue. This is a listen-only key monitor; macOS still sends key events to other apps.
 

@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import Security
+import ServiceManagement
 import AppKit
 import Carbon
 
@@ -161,6 +162,20 @@ final class FloatingCapturePanel: NSPanel {
     let model = Model()
     @Published var listening = false
     @Published var settingsVisible = false
+    @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var loginMessage = ""
+    func configureLogin(_ enabled: Bool) {
+        do {
+            if enabled && SMAppService.mainApp.status == .notRegistered { try SMAppService.mainApp.register() }
+            if !enabled && SMAppService.mainApp.status != .notRegistered { try SMAppService.mainApp.unregister() }
+            UserDefaults.standard.set(true, forKey: "loginPreferenceConfigured")
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            loginMessage = SMAppService.mainApp.status == .requiresApproval ? "Allow Voice Tasks in System Settings → General → Login Items & Extensions." : ""
+        } catch {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            loginMessage = "Could not update launch at login: \(error.localizedDescription)"
+        }
+    }
     private var panel: NSPanel?
     private var eventTap: CFMachPort?
     private var keyDown = false
@@ -169,6 +184,7 @@ final class FloatingCapturePanel: NSPanel {
     private var captureID = UUID()
 
     func setup() {
+        if !UserDefaults.standard.bool(forKey: "loginPreferenceConfigured") { configureLogin(true) }
         Task { await model.loadProjects() }
         setupMonitor(request: true)
     }
@@ -230,7 +246,7 @@ final class FloatingCapturePanel: NSPanel {
             p.contentView = NSHostingView(rootView: CapturePanel(controller: self)); panel = p
         }
         guard let p = panel, let screen = NSScreen.main else { return }
-        let visible = screen.visibleFrame; let width: CGFloat = min(440, visible.width - 24); let height: CGFloat = compact ? 92 : min(390, visible.height - 40)
+        let visible = screen.visibleFrame; let width: CGFloat = min(440, visible.width - 24); let height: CGFloat = compact ? 92 : min(440, visible.height - 40)
         p.setFrame(NSRect(x: visible.midX - width / 2, y: visible.minY + 24, width: width, height: height), display: true, animate: true)
         if activate { NSApp.activate(ignoringOtherApps: true); p.makeKeyAndOrderFront(nil) } else { p.orderFrontRegardless() }
     }
@@ -323,6 +339,8 @@ struct CapturePanel: View {
     }
     private var settings: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Toggle("Open at login", isOn: Binding(get: { controller.launchAtLogin }, set: { controller.configureLogin($0) }))
+            if !controller.loginMessage.isEmpty { Text(controller.loginMessage).font(.caption).foregroundStyle(.secondary) }
             Picker("Task app", selection: Binding(get: { model.service }, set: { model.switchService($0) })) { ForEach(TaskService.allCases) { Text($0.rawValue).tag($0) } }
             SecureField("Groq API key", text: $model.groq)
             SecureField("Todoist API token", text: $model.todoist)
